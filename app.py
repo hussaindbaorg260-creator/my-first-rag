@@ -7,7 +7,6 @@ import requests
 import os
 from google import genai
 import streamlit as st
-from sentence_transformers import SentenceTransformer
 
 
 # =========================================================
@@ -414,12 +413,16 @@ Try “What is ADOP and its phases?”, “What is Oracle Apps R12.2?” or “W
 # =========================================================
 @st.cache_resource
 def load_system_resources():
-    model_obj = SentenceTransformer("all-MiniLM-L6-v2")
+    # V7 Lightweight:
+    # SentenceTransformer/PyTorch is intentionally not loaded.
+    # Embeddings are generated through the Gemini API.
 
-    db_client = chromadb.PersistentClient(path="chroma_db_multi")
+    db_client = chromadb.PersistentClient(
+        path="chroma_db_gemini_experimental"
+    )
 
     db_collection = db_client.get_collection(
-        name="oracle_multi_pdf"
+        name="oracle_multi_pdf_gemini"
     )
 
     all_data = db_collection.get(
@@ -429,9 +432,9 @@ def load_system_resources():
     docs = all_data["documents"]
     metas = all_data["metadatas"]
 
-    return model_obj, db_collection, docs, metas
+    return db_collection, docs, metas
 
-model, collection, all_documents, all_metadatas = load_system_resources()
+collection, all_documents, all_metadatas = load_system_resources()
 
 
 # =========================================================
@@ -548,7 +551,11 @@ def semantic_search(question):
     merged = {}
 
     for retrieval_query in retrieval_queries:
-        embedding = model.encode(retrieval_query).tolist()
+        response = gemini_client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=retrieval_query
+        )
+        embedding = response.embeddings[0].values
 
         results = collection.query(
             query_embeddings=[embedding],
@@ -709,6 +716,118 @@ def select_intent_aware_top3(normalized_question, ranked_candidates):
         re.search(r"\badop\b", q)
         and re.search(r"\bphase(?:s)?\b|\bcycle\b", q)
     )
+
+    # Generic definition-aware selection.
+    # For simple "What is X?" questions, prefer one strong chunk that
+    # actually explains/defines X instead of selecting only mention-heavy
+    # chunks. This is generic and does not hardcode ADOP or page numbers.
+    definition_match = re.match(
+        r"^what\s+(?:is|are)\s+(.+?)[?!.]*$",
+        q.strip(),
+        flags=re.IGNORECASE
+    )
+
+    if definition_match and not is_adop_phase_question:
+        subject = definition_match.group(1).strip()
+        subject_pattern = re.compile(
+            r"\b" + re.escape(subject) + r"\b",
+            flags=re.IGNORECASE
+        )
+
+        def definition_quality(candidate):
+            text = candidate["document"]
+            lower_text = text.lower()
+
+            if not subject_pattern.search(text):
+                return (0, candidate.get("final_score", 0.0))
+
+            score = 0
+
+            # Strong explicit definition patterns.
+            if re.search(
+                r"\b" + re.escape(subject)
+                + r"\b\s+(?:is|are|means|refers\s+to|stands\s+for)\b",
+                text,
+                flags=re.IGNORECASE
+            ):
+                score += 8
+
+            # Strong tool / utility / process descriptions.
+            if re.search(
+                r"\b" + re.escape(subject)
+                + r"\b.{0,80}\b(?:tool|utility|process|system|application|feature)\b",
+                text,
+                flags=re.IGNORECASE | re.DOTALL
+            ):
+                score += 6
+
+            if re.search(
+                r"\b(?:tool|utility|process|system|application|feature)\b.{0,80}\b"
+                + re.escape(subject) + r"\b",
+                text,
+                flags=re.IGNORECASE | re.DOTALL
+            ):
+                score += 4
+
+            # Purpose / functional description.
+            if re.search(
+                r"\b" + re.escape(subject)
+                + r"\b.{0,100}\b(?:used\s+to|used\s+for|performs|provides|allows|manages|orchestrates)\b",
+                text,
+                flags=re.IGNORECASE | re.DOTALL
+            ):
+                score += 6
+
+            # Useful descriptive construction such as:
+            # "Patching is performed by running the adop (...) utility."
+            if re.search(
+                r"\b(?:performed|running|using)\b.{0,100}\b"
+                + re.escape(subject)
+                + r"\b",
+                text,
+                flags=re.IGNORECASE | re.DOTALL
+            ):
+                score += 5
+
+            # Parenthetical expansion close to the subject is strong
+            # definition evidence for acronyms / technical terms.
+            if re.search(
+                r"\b" + re.escape(subject) + r"\b\s*\([^)]{3,100}\)",
+                text,
+                flags=re.IGNORECASE
+            ):
+                score += 7
+
+            # Heading/context hints.
+            if "tools" in lower_text or "utilities" in lower_text:
+                score += 2
+
+            return (score, candidate.get("final_score", 0.0))
+
+        definition_candidates = sorted(
+            ranked_candidates,
+            key=definition_quality,
+            reverse=True
+        )
+
+        if definition_candidates:
+            best_definition = definition_candidates[0]
+            best_quality = definition_quality(best_definition)[0]
+
+            # Only override normal ranking when genuine definition evidence
+            # exists. Otherwise preserve the original Top-3 behavior.
+            if best_quality > 0:
+                selected = [best_definition]
+
+                for candidate in ranked_candidates:
+                    if len(selected) >= 3:
+                        break
+                    if candidate is not best_definition:
+                        selected.append(candidate)
+
+                return selected[:3]
+
+        return ranked_candidates[:3]
 
     if not is_adop_phase_question:
         return ranked_candidates[:3]
@@ -1228,7 +1347,7 @@ def recover_grounded_definition(question, candidates):
 
     purpose_patterns = re.compile(
         r"\b(?:applies?|performs?|used\s+(?:to|for)|allows?|provides?|"
-        r"manages?|creates?|adds?|removes?|updates?|configures?)\b",
+        r"manages?|creates?|adds?|removes?|updates?|configures?|orchestrates?)\b",
         flags=re.IGNORECASE,
     )
     relation_patterns = re.compile(
@@ -1461,8 +1580,8 @@ def recover_grounded_definition(question, candidates):
         anchored_purpose_candidates = []
 
         subject_anchor_re = re.compile(
-            rf"^\s*(?:{re.escape(subject)}\b|"
-            rf"(?:the\s+)?{re.escape(subject)}\b)",
+            rf"^\s*(?:the\s+)?{re.escape(subject)}\b"
+            rf"(?:\s+(?:tool|utility|process|system|application|feature))?",
             flags=re.IGNORECASE,
         )
 
@@ -1575,6 +1694,82 @@ def recover_grounded_definition(question, candidates):
 
     if primary is None:
         return None
+
+    # Generic parenthetical technical-definition recovery.
+    #
+    # Example structure:
+    #     SUBJECT (descriptive expansion) utility/tool
+    #
+    # If retrieved evidence explicitly contains this structure, prefer a
+    # concise grounded definition over a weaker relation/version statement.
+    # No product name, technical term, or page number is hardcoded.
+    parenthetical_definition = None
+
+    parenthetical_re = re.compile(
+        rf"\b{re.escape(subject)}\b\s*"
+        r"\(\s*([A-Za-z][A-Za-z0-9 /_.+-]{2,100}?)\s*\)"
+        r"\s+(utility|tool|process|system|application|feature)\b",
+        flags=re.IGNORECASE,
+    )
+
+    for candidate in candidates:
+        candidate_text = normalize_piece(
+            candidate.get("document", "")
+        )
+
+        parenthetical_match = parenthetical_re.search(
+            candidate_text
+        )
+
+        if not parenthetical_match:
+            continue
+
+        expansion = normalize_piece(
+            parenthetical_match.group(1)
+        )
+        object_type = parenthetical_match.group(2).lower()
+
+        # Avoid repeating the requested acronym/term when the
+        # parenthetical expansion begins with it.
+        expansion_words = expansion.split()
+        subject_words = subject.split()
+
+        if (
+            expansion_words
+            and subject_words
+            and expansion_words[0].lower()
+            == subject_words[0].lower()
+            and len(expansion_words) > 1
+        ):
+            expansion = " ".join(expansion_words[1:])
+
+        if not expansion:
+            continue
+
+        # "utility" and "tool" are equivalent descriptive categories
+        # for this concise definition form. Normalize utility -> tool
+        # to keep the output natural and consistent.
+        definition_type = (
+            "tool"
+            if object_type in ("utility", "tool")
+            else object_type
+        )
+
+        article = (
+            "an"
+            if expansion[:1].lower() in "aeiou"
+            else "a"
+        )
+
+        parenthetical_definition = (
+            f"{subject} is {article} "
+            f"{expansion} {definition_type}."
+        )
+
+        break
+
+    if parenthetical_definition is not None:
+        primary = parenthetical_definition
 
     selected = [primary]
     if support:
@@ -2614,16 +2809,68 @@ with st.sidebar:
                                 ]
 
                                 # ---------------------------------
-                                # 3. Generate embeddings using the
-                                # already-loaded embedding model.
+                                # 3. Generate embeddings using
+                                # Gemini Embedding API.
                                 # ---------------------------------
                                 with st.spinner(
-                                    "Generating embeddings..."
+                                    "Generating Gemini embeddings..."
                                 ):
-                                    embeddings = model.encode(
-                                        documents_to_add,
-                                        show_progress_bar=False
-                                    ).tolist()
+                                    embeddings = []
+
+                                    # Process chunks in small batches
+                                    # instead of loading a local model.
+                                    embedding_batch_size = 20
+
+                                    for batch_start in range(
+                                        0,
+                                        len(documents_to_add),
+                                        embedding_batch_size
+                                    ):
+                                        batch_documents = documents_to_add[
+                                            batch_start:
+                                            batch_start + embedding_batch_size
+                                        ]
+
+                                        response = (
+                                            gemini_client.models.embed_content(
+                                                model="gemini-embedding-001",
+                                                contents=batch_documents
+                                            )
+                                        )
+
+                                        batch_embeddings = [
+                                            item.values
+                                            for item in response.embeddings
+                                        ]
+
+                                        if len(batch_embeddings) != len(
+                                            batch_documents
+                                        ):
+                                            raise RuntimeError(
+                                                "Gemini embedding count "
+                                                "does not match chunk count."
+                                            )
+
+                                        if any(
+                                            len(vector) != 3072
+                                            for vector in batch_embeddings
+                                        ):
+                                            raise RuntimeError(
+                                                "Unexpected Gemini embedding "
+                                                "dimension. Expected 3072."
+                                            )
+
+                                        embeddings.extend(
+                                            batch_embeddings
+                                        )
+
+                                    if len(embeddings) != len(
+                                        documents_to_add
+                                    ):
+                                        raise RuntimeError(
+                                            "Final embedding count does not "
+                                            "match document chunk count."
+                                        )
 
                                 # ---------------------------------
                                 # 4. Add records to existing
